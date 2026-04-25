@@ -1,0 +1,25 @@
+{
+  "name": "orbita",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "sync:ide": "cp -r .aiox/. .claude/ && cp -r .aiox/. .cursor/ && echo '✅ Sincronização de Contexto Concluída para Redundância'",
+    "aiox:init": "npx aiox-core init",
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://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@github.com/ValmirAutomacao/orbita.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/ValmirAutomacao/orbita/issues"
+  },
+  "homepage": "https://github.com/ValmirAutomacao/orbita#readme"
+}
