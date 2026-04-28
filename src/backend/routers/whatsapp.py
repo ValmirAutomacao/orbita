@@ -12,11 +12,12 @@ import os
 import re
 import unicodedata
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from supabase import Client, create_client
+
+from services.uazapi import UazapiClient, UazapiError
 
 router = APIRouter()
 bearer_scheme = HTTPBearer()
@@ -25,9 +26,6 @@ bearer_scheme = HTTPBearer()
 
 SUPABASE_URL        = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
-UAZAPI_BASE         = os.environ.get("UAZAPI_BASE_URL", "https://uazapi.dev")
-UAZAPI_ADMINTOKEN   = os.environ["UAZAPI_ADMINTOKEN"]
-SYSTEM_NAME         = os.environ.get("UAZAPI_SYSTEM_NAME", "Pulseo")
 
 # ── Supabase service-role client (bypasses RLS) ───────────────────────────────
 
@@ -114,64 +112,36 @@ async def provision(
 
     # 6. Create instance on Uazapi (admintoken — server-side only) ─────────────
     api_base_url = os.environ.get("API_PUBLIC_URL", "https://api.pulseo.pt")
-    inst_token: str
-    inst_id: str
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        # 6a. Create instance
-        create_resp = await client.post(
-            f"{UAZAPI_BASE}/instance/create",
-            headers={"admintoken": UAZAPI_ADMINTOKEN, "Content-Type": "application/json"},
-            json={"name": instance_name, "systemName": SYSTEM_NAME},
-        )
-        if create_resp.status_code not in (200, 201):
-            raise HTTPException(
-                status_code=502,
-                detail=f"Uazapi recusou a criação da instância: {create_resp.text[:200]}",
-            )
-        uazapi_data = create_resp.json()
-        instance    = uazapi_data.get("instance", {})
-        # Support both response shapes (instancia_uazapi.md §3 vs §4)
-        inst_id    = instance.get("id") or instance.get("instanceId", "")
-        inst_token = instance.get("token", "")
+    try:
+        uazapi = UazapiClient()
+        info   = await uazapi.create_instance(instance_name)
+        inst_token = info.token
+        inst_id    = info.instance_id
 
-        if not inst_token:
-            raise HTTPException(status_code=502, detail="Uazapi não retornou token.")
-
-        inst_headers = {"token": inst_token, "Content-Type": "application/json"}
+        inst_client = UazapiClient(instance_token=inst_token)
 
         # 6b. Configure webhook (PRD-v3 §4.2.1 passo 2) ──────────────────────
-        await client.post(
-            f"{UAZAPI_BASE}/webhook",
-            headers=inst_headers,
-            json={
-                "url": f"{api_base_url}/webhook/whatsapp/{tenant_id}",
-                "events": ["connection", "messages", "messages_update", "chats", "call"],
-            },
+        await inst_client.configure_webhook(
+            url=f"{api_base_url}/webhook/whatsapp/{tenant_id}",
+            events=["connection", "messages", "messages_update", "chats", "call"],
         )
 
-        # 6c. Configure anti-ban delay (PRD-v3 §4.2.1 passo 3) ───────────────
-        # Default: assume number is new (conservative). Frontend updates later
-        # if is_new_number == False via PATCH /api/v1/whatsapp/delay-settings.
-        await client.post(
-            f"{UAZAPI_BASE}/instance/updateDelaySettings",
-            headers=inst_headers,
-            json={"msg_delay_min": 5, "msg_delay_max": 12},
-        )
+        # 6c. Anti-ban delay — conservative default for new numbers ───────────
+        await inst_client.configure_delay(min_s=5, max_s=12)
 
-        # 6d. Configure privacy (PRD-v3 §4.2.1 passo 4) ──────────────────────
-        await client.post(
-            f"{UAZAPI_BASE}/instance/privacy",
-            headers=inst_headers,
-            json={
-                "groupadd":     "contacts",
-                "last":         "contacts",
-                "online":       "contacts",
-                "profile":      "contacts",
-                "readreceipts": "all",
-                "calladd":      "known",
-            },
-        )
+        # 6d. Privacy hardening (PRD-v3 §4.2.1 passo 4) ──────────────────────
+        await inst_client.configure_privacy({
+            "groupadd":     "contacts",
+            "last":         "contacts",
+            "online":       "contacts",
+            "profile":      "contacts",
+            "readreceipts": "all",
+            "calladd":      "known",
+        })
+
+    except UazapiError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
 
     # 7. Persist to tenant_settings ───────────────────────────────────────────
     db.table("tenant_settings").upsert(

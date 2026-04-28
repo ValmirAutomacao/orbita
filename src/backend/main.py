@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from routers import whatsapp  # noqa: E402
+from routers import webhooks, whatsapp  # noqa: E402
 
 app = FastAPI(title="Pulseo API", version="0.1.0")
 
@@ -22,6 +22,7 @@ app.add_middleware(
 )
 
 app.include_router(whatsapp.router, prefix="/api/v1/whatsapp", tags=["whatsapp"])
+app.include_router(webhooks.router, prefix="/webhook", tags=["webhooks"])
 
 
 @app.get("/healthz")
