@@ -1,0 +1,53 @@
+# ── Secrets & Tokens ───────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+.mcp.json
+
+# ── Internal Product Docs (PRD, Stories, Epics, Cronograma) ─
+PRD*.md
+docs/
+cronograma*.md
+SKILL_*.md
+instancia_*.md
+
+# ── Images / Screenshots ────────────────────────────────────
+image/
+images/
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.svg
+
+# ── Internal Agent Workflows & Framework ───────────────────
+orbita/.agent/
+orbita/.aiox-core/
+.aiox/
+.ai/
+.cursor/
+
+# ── Dependencies ────────────────────────────────────────────
+node_modules/
+src/frontend/node_modules/
+
+# ── Build & Cache ───────────────────────────────────────────
+dist/
+build/
+.cache/
+*.log
+logs/
+
+# ── IDE & OS ────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+.vscode/settings.json
+
+# ── Claude local settings ──────────────────────────────────
+.claude/settings.local.json
+*.docx
