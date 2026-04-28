@@ -173,3 +173,12 @@ class UazapiClient:
                 json=settings,
             )
         self._check(resp, "configure_privacy")
+
+    async def configure_warmup_delay(self, min_s: int, max_s: int) -> None:
+        """
+        Apply warm-up-aware message delay to the instance.
+
+        Delegates to configure_delay — exists as a named method so callers
+        can express intent (warm-up schedule) instead of raw seconds.
+        """
+        await self.configure_delay(min_s=min_s, max_s=max_s)

@@ -1,14 +1,17 @@
 """
 WhatsApp endpoints — all Uazapi calls are server-side only.
 
-POST /provision  — create instance + configure webhook/anti-ban (idempotent)
-POST /connect    — request QR Code from Uazapi, return base64 to frontend
-GET  /status     — poll Uazapi connection status; update tenant_whatsapp_config
+POST /provision      — create instance + configure webhook/anti-ban (idempotent)
+POST /connect        — request QR Code from Uazapi, return base64 to frontend
+GET  /status         — poll Uazapi connection status; update tenant_whatsapp_config
+POST /warmup/apply   — recalculate warmup week, apply delays, persist to DB
+GET  /health/today   — compute health_score and upsert whatsapp_health_metrics
 """
 
 import os
 import re
 import unicodedata
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -16,6 +19,7 @@ from pydantic import BaseModel
 from supabase import Client, create_client
 
 from services.uazapi import UazapiClient, UazapiError
+from services.warmup import WarmupConfig, compute_warmup_config, compute_health_score
 
 router = APIRouter()
 bearer_scheme = HTTPBearer()
@@ -57,6 +61,23 @@ class StatusResponse(BaseModel):
     profileName: str | None = None
     isBusiness:  bool | None = None
     ownerJid:    str | None = None
+
+
+class WarmupApplyResponse(BaseModel):
+    warmup_week: int
+    delay_min_s: int
+    delay_max_s: int
+    msg_limit:   int
+
+
+class HealthResponse(BaseModel):
+    date:          str
+    health_score:  float
+    warmup_week:   int
+    msgs_sent:     int
+    msgs_received: int
+    block_count:   int
+    msgs_limit_hit: bool
 
 
 # ── Shared auth helper ────────────────────────────────────────────────────────
@@ -228,7 +249,6 @@ async def get_status(
         return StatusResponse(status="qrExpired")
 
     if conn.state == "connected":
-        from datetime import datetime, timezone
         update: dict = {
             "tenant_id":  tenant_id,
             "status":     "connected",
@@ -249,4 +269,185 @@ async def get_status(
         profileName=conn.profile_name,
         isBusiness=conn.is_business,
         ownerJid=conn.owner_jid,
+    )
+
+
+# ── POST /warmup/apply ────────────────────────────────────────────────────────
+
+@router.post("/warmup/apply", response_model=WarmupApplyResponse, status_code=status.HTTP_200_OK)
+async def warmup_apply(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+) -> WarmupApplyResponse:
+    """
+    Recalculate the current warm-up week from connected_at / warmup_started_at,
+    apply the correct delays to the Uazapi instance, and persist to
+    tenant_whatsapp_config.
+
+    Can be called on first connect and by a Celery beat job (future story).
+    """
+    jwt = credentials.credentials
+    db  = _supabase()
+    tenant_id = await _resolve_tenant(jwt, db)
+    token     = await _get_instance_token(tenant_id, db)
+
+    # Load current warm-up state from tenant_whatsapp_config
+    row = (
+        db.table("tenant_whatsapp_config")
+        .select("is_new_number, connected_at, warmup_started_at, warmup_week")
+        .eq("tenant_id", tenant_id)
+        .single()
+        .execute()
+    )
+    cfg_data = row.data or {}
+
+    def _parse_dt(val: str | None) -> datetime | None:
+        if not val:
+            return None
+        try:
+            return datetime.fromisoformat(val.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    warmup_cfg: WarmupConfig = compute_warmup_config(
+        is_new_number=cfg_data.get("is_new_number", False),
+        connected_at=_parse_dt(cfg_data.get("connected_at")),
+        warmup_started_at=_parse_dt(cfg_data.get("warmup_started_at")),
+    )
+
+    # Apply delays to Uazapi
+    try:
+        await UazapiClient(instance_token=token).configure_warmup_delay(
+            min_s=warmup_cfg.delay_min,
+            max_s=warmup_cfg.delay_max,
+        )
+    except UazapiError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    # Persist warm-up state
+    now_iso = datetime.now(timezone.utc).isoformat()
+    update: dict = {
+        "tenant_id":  tenant_id,
+        "warmup_week": warmup_cfg.week,
+        "delay_min_s": warmup_cfg.delay_min,
+        "delay_max_s": warmup_cfg.delay_max,
+        "updated_at":  now_iso,
+    }
+    # Set warmup_started_at only on first call for new numbers
+    if cfg_data.get("is_new_number") and not cfg_data.get("warmup_started_at"):
+        update["warmup_started_at"] = now_iso
+
+    db.table("tenant_whatsapp_config").upsert(
+        update, on_conflict="tenant_id"
+    ).execute()
+
+    return WarmupApplyResponse(
+        warmup_week=warmup_cfg.week,
+        delay_min_s=warmup_cfg.delay_min,
+        delay_max_s=warmup_cfg.delay_max,
+        msg_limit=warmup_cfg.msg_limit,
+    )
+
+
+# ── GET /health/today ─────────────────────────────────────────────────────────
+
+@router.get("/health/today", response_model=HealthResponse, status_code=status.HTTP_200_OK)
+async def health_today(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+) -> HealthResponse:
+    """
+    Compute today's health metrics from whatsapp_messages_log and
+    tenant_whatsapp_config, then upsert into whatsapp_health_metrics.
+    Returns the computed metrics.
+    """
+    jwt = credentials.credentials
+    db  = _supabase()
+    tenant_id = await _resolve_tenant(jwt, db)
+
+    today = datetime.now(timezone.utc).date()
+    today_str = today.isoformat()
+
+    # Load connection config (warmup, delays, status)
+    cfg_row = (
+        db.table("tenant_whatsapp_config")
+        .select("status, is_new_number, connected_at, warmup_started_at, warmup_week, delay_min_s, delay_max_s")
+        .eq("tenant_id", tenant_id)
+        .single()
+        .execute()
+    )
+    cfg = cfg_row.data or {}
+
+    def _parse_dt(val: str | None) -> datetime | None:
+        if not val:
+            return None
+        try:
+            return datetime.fromisoformat(val.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    warmup_cfg = compute_warmup_config(
+        is_new_number=cfg.get("is_new_number", False),
+        connected_at=_parse_dt(cfg.get("connected_at")),
+        warmup_started_at=_parse_dt(cfg.get("warmup_started_at")),
+    )
+
+    # Query today's messages from whatsapp_messages_log
+    start_of_day = f"{today_str}T00:00:00+00:00"
+    end_of_day   = f"{today_str}T23:59:59+00:00"
+
+    msgs_row = (
+        db.table("whatsapp_messages_log")
+        .select("direction, status")
+        .eq("tenant_id", tenant_id)
+        .gte("timestamp", start_of_day)
+        .lte("timestamp", end_of_day)
+        .execute()
+    )
+    messages = msgs_row.data or []
+
+    msgs_sent     = sum(1 for m in messages if m.get("direction") == "outbound")
+    msgs_received = sum(1 for m in messages if m.get("direction") == "inbound")
+    block_count   = sum(1 for m in messages if m.get("status") == "blocked")
+
+    # Delivery and response rates
+    delivered   = sum(1 for m in messages if m.get("direction") == "outbound" and m.get("status") in ("delivered", "read"))
+    delivery_rate = round(delivered / msgs_sent * 100, 1) if msgs_sent else None
+    response_rate = round(msgs_received / msgs_sent * 100, 1) if msgs_sent else None
+
+    msgs_limit_hit = (
+        warmup_cfg.msg_limit != -1 and msgs_sent >= warmup_cfg.msg_limit
+    )
+
+    score = compute_health_score(
+        status=cfg.get("status", "disconnected"),
+        warmup_cfg=warmup_cfg,
+        block_count=block_count,
+        msgs_sent=msgs_sent,
+        msg_limit=warmup_cfg.msg_limit,
+    )
+
+    # Upsert into whatsapp_health_metrics
+    db.table("whatsapp_health_metrics").upsert(
+        {
+            "tenant_id":       tenant_id,
+            "date":            today_str,
+            "msgs_sent":       msgs_sent,
+            "msgs_received":   msgs_received,
+            "block_count":     block_count,
+            "delivery_rate":   delivery_rate,
+            "response_rate":   response_rate,
+            "health_score":    score,
+            "warmup_week":     warmup_cfg.week,
+            "msgs_limit_hit":  msgs_limit_hit,
+        },
+        on_conflict="tenant_id,date",
+    ).execute()
+
+    return HealthResponse(
+        date=today_str,
+        health_score=score,
+        warmup_week=warmup_cfg.week,
+        msgs_sent=msgs_sent,
+        msgs_received=msgs_received,
+        block_count=block_count,
+        msgs_limit_hit=msgs_limit_hit,
     )
