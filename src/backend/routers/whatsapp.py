@@ -1,11 +1,9 @@
 """
-POST /api/v1/whatsapp/provision
+WhatsApp endpoints — all Uazapi calls are server-side only.
 
-Creates a Uazapi instance for the authenticated tenant using the admintoken
-(server-side only — never exposed to the frontend).
-
-Naming rule: {niche}_{business_name_slug}   (PRD-v3 §4.2.2)
-  e.g. "barbearia_barber_club"  (lowercase, underscores, ASCII-only)
+POST /provision  — create instance + configure webhook/anti-ban (idempotent)
+POST /connect    — request QR Code from Uazapi, return base64 to frontend
+GET  /status     — poll Uazapi connection status; update tenant_whatsapp_config
 """
 
 import os
@@ -46,9 +44,53 @@ def _slugify(text: str) -> str:
 # ── Response schema ───────────────────────────────────────────────────────────
 
 class ProvisionResponse(BaseModel):
-    token:        str
     instanceId:   str
     instanceName: str
+
+
+class ConnectResponse(BaseModel):
+    qrcode: str          # data:image/png;base64,…
+
+
+class StatusResponse(BaseModel):
+    status:      str             # connected | connecting | disconnected | qrExpired
+    profileName: str | None = None
+    isBusiness:  bool | None = None
+    ownerJid:    str | None = None
+
+
+# ── Shared auth helper ────────────────────────────────────────────────────────
+
+async def _resolve_tenant(jwt: str, db: Client) -> str:
+    """Validate JWT and return tenant_id. Raises 401/400 on failure."""
+    user_resp = db.auth.get_user(jwt)
+    if not user_resp or not user_resp.user:
+        raise HTTPException(status_code=401, detail="Token inválido ou expirado.")
+    user_row = (
+        db.table("users")
+        .select("tenant_id")
+        .eq("id", str(user_resp.user.id))
+        .single()
+        .execute()
+    )
+    if not user_row.data or not user_row.data.get("tenant_id"):
+        raise HTTPException(status_code=400, detail="Tenant não encontrado para este usuário.")
+    return user_row.data["tenant_id"]
+
+
+async def _get_instance_token(tenant_id: str, db: Client) -> str:
+    """Retrieve stored Uazapi instance token from tenant_settings. Raises 404 if not provisioned."""
+    row = (
+        db.table("tenant_settings")
+        .select("whatsapp_token")
+        .eq("tenant_id", tenant_id)
+        .single()
+        .execute()
+    )
+    token = (row.data or {}).get("whatsapp_token")
+    if not token:
+        raise HTTPException(status_code=404, detail="Instância WhatsApp não provisionada. Chame /provision primeiro.")
+    return token
 
 
 # ── Endpoint ──────────────────────────────────────────────────────────────────
@@ -59,24 +101,7 @@ async def provision(
 ) -> ProvisionResponse:
     jwt = credentials.credentials
     db  = _supabase()
-
-    # 1. Validate JWT and resolve user ─────────────────────────────────────────
-    user_resp = db.auth.get_user(jwt)
-    if not user_resp or not user_resp.user:
-        raise HTTPException(status_code=401, detail="Token inválido ou expirado.")
-    auth_user = user_resp.user
-
-    # 2. Resolve tenant_id from public.users ──────────────────────────────────
-    user_row = (
-        db.table("users")
-        .select("tenant_id")
-        .eq("id", str(auth_user.id))
-        .single()
-        .execute()
-    )
-    if not user_row.data or not user_row.data.get("tenant_id"):
-        raise HTTPException(status_code=400, detail="Tenant não encontrado para este usuário.")
-    tenant_id: str = user_row.data["tenant_id"]
+    tenant_id = await _resolve_tenant(jwt, db)
 
     # 3. Load tenant data (business_name + niche) ─────────────────────────────
     tenant_row = (
@@ -105,7 +130,6 @@ async def provision(
     existing = settings_row.data or {}
     if existing.get("whatsapp_token"):
         return ProvisionResponse(
-            token=existing["whatsapp_token"],
             instanceId=existing["whatsapp_instance_id"],
             instanceName=existing["whatsapp_instance_name"],
         )
@@ -155,7 +179,74 @@ async def provision(
     ).execute()
 
     return ProvisionResponse(
-        token=inst_token,
         instanceId=inst_id,
         instanceName=instance_name,
+    )
+
+
+# ── POST /connect ─────────────────────────────────────────────────────────────
+
+@router.post("/connect", response_model=ConnectResponse, status_code=status.HTTP_200_OK)
+async def connect(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+) -> ConnectResponse:
+    """Request a QR Code from Uazapi for the tenant's instance. Returns base64 image."""
+    jwt = credentials.credentials
+    db  = _supabase()
+    tenant_id = await _resolve_tenant(jwt, db)
+    token     = await _get_instance_token(tenant_id, db)
+
+    try:
+        status_obj = await UazapiClient(instance_token=token).connect()
+    except UazapiError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    if not status_obj.qrcode:
+        raise HTTPException(status_code=502, detail="Uazapi não retornou QR Code.")
+
+    return ConnectResponse(qrcode=status_obj.qrcode)
+
+
+# ── GET /status ───────────────────────────────────────────────────────────────
+
+@router.get("/status", response_model=StatusResponse, status_code=status.HTTP_200_OK)
+async def get_status(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+) -> StatusResponse:
+    """
+    Poll Uazapi connection status. When 'connected', syncs phone_number /
+    profile_name / owner_jid into tenant_whatsapp_config.
+    """
+    jwt = credentials.credentials
+    db  = _supabase()
+    tenant_id = await _resolve_tenant(jwt, db)
+    token     = await _get_instance_token(tenant_id, db)
+
+    try:
+        conn = await UazapiClient(instance_token=token).get_status()
+    except UazapiError:
+        return StatusResponse(status="qrExpired")
+
+    if conn.state == "connected":
+        from datetime import datetime, timezone
+        update: dict = {
+            "tenant_id":  tenant_id,
+            "status":     "connected",
+            "connected_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if conn.phone_number: update["phone_number"] = conn.phone_number
+        if conn.profile_name: update["profile_name"] = conn.profile_name
+        if conn.owner_jid:    update["owner_jid"]    = conn.owner_jid
+        if conn.is_business is not None: update["is_business"] = conn.is_business
+
+        db.table("tenant_whatsapp_config").upsert(
+            update, on_conflict="tenant_id"
+        ).execute()
+
+    return StatusResponse(
+        status=conn.state,
+        profileName=conn.profile_name,
+        isBusiness=conn.is_business,
+        ownerJid=conn.owner_jid,
     )

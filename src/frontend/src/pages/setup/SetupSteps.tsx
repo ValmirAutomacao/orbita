@@ -340,36 +340,41 @@ export function StepServices() {
 
 // ---------------------------------------------------------------------------
 // WhatsApp QR Code connection panel (embedded in Step 4)
-// Polling interval: 5 s per instancia_uazapi.md "Dica de Ouro"
-// QR countdown: 120 s (PRD-v3 §5.2.7 — 2 minutos)
+// QR countdown: 120 s (PRD-v3 §5.2.7)
 // Polling: 3 s (PRD-v3 §4.2.1 passo 8)
 // ---------------------------------------------------------------------------
 
-const QR_TIMEOUT_S = 120;
+const QR_TIMEOUT_S     = 120;
 const POLL_INTERVAL_MS = 3_000;
+const LS_KEY           = 'pulseo_wa_connected';
 
 interface WhatsAppConnectProps {
-  /** Instance token from Supabase (tenant_whatsapp_config). Null while loading. */
-  instanceToken: string | null;
+  /** Supabase JWT — backend resolves instance token server-side. */
+  jwt: string;
   onConnected: () => void;
 }
 
-function WhatsAppConnect({ instanceToken, onConnected }: WhatsAppConnectProps) {
+function WhatsAppConnect({ jwt, onConnected }: WhatsAppConnectProps) {
   const [qrDataUri, setQrDataUri] = useState<string | null>(null);
   const [connectionStatus, setConnectionStatus] = useState<InstanceStatus | 'idle' | 'loading'>('idle');
   const [countdown, setCountdown] = useState(QR_TIMEOUT_S);
   const [error, setError] = useState<string | null>(null);
 
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollRef      = useRef<ReturnType<typeof setInterval> | null>(null);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const stopPolling = () => {
-    if (pollRef.current) clearInterval(pollRef.current);
+    if (pollRef.current)      clearInterval(pollRef.current);
     if (countdownRef.current) clearInterval(countdownRef.current);
   };
 
+  const handleConnected = useCallback(() => {
+    stopPolling();
+    localStorage.setItem(LS_KEY, 'true');
+    onConnected();
+  }, [onConnected]);
+
   const startQr = useCallback(async () => {
-    if (!instanceToken) return;
     stopPolling();
     setError(null);
     setConnectionStatus('loading');
@@ -377,11 +382,11 @@ function WhatsAppConnect({ instanceToken, onConnected }: WhatsAppConnectProps) {
     setCountdown(QR_TIMEOUT_S);
 
     try {
-      const { qrcode } = await connectInstance(instanceToken);
+      const { qrcode } = await connectInstance(jwt);
       setQrDataUri(qrcode);
       setConnectionStatus('connecting');
-    } catch {
-      setError('Não foi possível gerar o QR Code. Verifique a conexão com o servidor.');
+    } catch (e) {
+      setError((e as Error).message ?? 'Não foi possível gerar o QR Code.');
       setConnectionStatus('idle');
       return;
     }
@@ -389,23 +394,18 @@ function WhatsAppConnect({ instanceToken, onConnected }: WhatsAppConnectProps) {
     // Countdown ticker
     countdownRef.current = setInterval(() => {
       setCountdown((s) => {
-        if (s <= 1) {
-          clearInterval(countdownRef.current!);
-          return 0;
-        }
+        if (s <= 1) { clearInterval(countdownRef.current!); return 0; }
         return s - 1;
       });
     }, 1_000);
 
-    // Status polling every 5 s (instancia_uazapi.md — Dica de Ouro)
+    // Status polling every 3 s (PRD-v3 §4.2.1 passo 8)
     pollRef.current = setInterval(async () => {
       try {
-        const result = await getInstanceStatus(instanceToken);
+        const result = await getInstanceStatus(jwt);
         setConnectionStatus(result.status);
-
         if (result.status === 'connected') {
-          stopPolling();
-          onConnected();
+          handleConnected();
         } else if (result.status === 'qrExpired') {
           stopPolling();
           setQrDataUri(null);
@@ -414,15 +414,14 @@ function WhatsAppConnect({ instanceToken, onConnected }: WhatsAppConnectProps) {
         // transient network error — keep polling
       }
     }, POLL_INTERVAL_MS);
-  }, [instanceToken, onConnected]);
+  }, [jwt, handleConnected]);
 
-  // Auto-start when token becomes available
   useEffect(() => {
-    if (instanceToken) startQr();
+    startQr();
     return stopPolling;
-  }, [instanceToken]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const isExpired = connectionStatus === 'qrExpired' || countdown === 0;
+  const isExpired   = connectionStatus === 'qrExpired' || countdown === 0;
   const isConnected = connectionStatus === 'connected';
 
   if (isConnected) {
@@ -508,23 +507,31 @@ function WhatsAppConnect({ instanceToken, onConnected }: WhatsAppConnectProps) {
 
 export function StepSettings() {
   const { session } = useAuth();
-  const [whatsappConnected, setWhatsappConnected] = useState(false);
-  const [instanceToken, setInstanceToken] = useState<string | null>(null);
+  const jwt = session?.access_token ?? null;
+
+  // Persist connected state across page refreshes
+  const [whatsappConnected, setWhatsappConnected] = useState(
+    () => localStorage.getItem('pulseo_wa_connected') === 'true',
+  );
   const [provisionError, setProvisionError] = useState<string | null>(null);
   const [provisioning, setProvisioning] = useState(false);
 
-  // Provision on mount: call backend → get instance token
-  useEffect(() => {
-    const jwt = session?.access_token;
-    if (!jwt || instanceToken) return;
-
+  const provision = useCallback(() => {
+    if (!jwt) return;
     setProvisioning(true);
     setProvisionError(null);
     provisionInstance(jwt)
-      .then((r) => setInstanceToken(r.token))
+      .then(() => { /* instance ready on backend */ })
       .catch((e: Error) => setProvisionError(e.message))
       .finally(() => setProvisioning(false));
-  }, [session?.access_token]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [jwt]);
+
+  // Provision on mount so instance token is ready on backend
+  useEffect(() => { provision(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleConnected = useCallback(() => {
+    setWhatsappConnected(true);
+  }, []);
 
   return (
     <div>
@@ -553,16 +560,7 @@ export function StepSettings() {
           <div className="flex flex-col items-center gap-3 py-6">
             <p className="text-sm text-red-400 text-center max-w-xs">{provisionError}</p>
             <button
-              onClick={() => {
-                const jwt = session?.access_token;
-                if (!jwt) return;
-                setProvisionError(null);
-                setProvisioning(true);
-                provisionInstance(jwt)
-                  .then((r) => setInstanceToken(r.token))
-                  .catch((e: Error) => setProvisionError(e.message))
-                  .finally(() => setProvisioning(false));
-              }}
+              onClick={provision}
               className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-xl transition-all"
             >
               <RefreshCw className="w-3.5 h-3.5" />
@@ -571,10 +569,23 @@ export function StepSettings() {
           </div>
         )}
 
-        {!provisioning && !provisionError && (
+        {/* Show connected badge if already connected (localStorage), else show QR */}
+        {!provisioning && !provisionError && whatsappConnected && (
+          <div className="flex flex-col items-center gap-3 py-8">
+            <div className="w-16 h-16 rounded-full bg-green-500/20 border-2 border-green-500/40 flex items-center justify-center shadow-[0_0_24px_rgba(74,222,128,0.25)]">
+              <CheckCircle2 className="w-8 h-8 text-green-400" />
+            </div>
+            <p className="text-green-400 font-semibold text-sm">WhatsApp Business conectado!</p>
+            <p className="text-zinc-500 text-xs text-center max-w-xs">
+              Seu número está vinculado. Mensagens automáticas já estão ativas.
+            </p>
+          </div>
+        )}
+
+        {!provisioning && !provisionError && !whatsappConnected && jwt && (
           <WhatsAppConnect
-            instanceToken={instanceToken}
-            onConnected={() => setWhatsappConnected(true)}
+            jwt={jwt}
+            onConnected={handleConnected}
           />
         )}
       </div>
