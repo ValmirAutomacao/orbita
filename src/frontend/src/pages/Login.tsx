@@ -11,7 +11,7 @@ export default function Login() {
   };
 
   const handleSetup = () => {
-    navigate('/setup/welcome');
+    navigate('/register');
   };
 
   return (
